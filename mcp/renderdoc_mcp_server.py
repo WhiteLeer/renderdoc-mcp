@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -241,11 +242,109 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                     },
                     "save_json": {
                         "type": "boolean",
-                        "description": "Whether to persist detailed json file next to rdc.",
+                        "description": "Whether to persist analysis artifacts to disk.",
+                        "default": True,
+                    },
+                    "save_root_dir": {
+                        "type": "string",
+                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                    },
+                    "open_report": {
+                        "type": "boolean",
+                        "description": "Whether to open generated HTML report after analysis.",
                         "default": True,
                     },
                 },
                 "required": ["rdc_path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "focus_rdc_event",
+            "description": "Open/switch to an .rdc in qrenderdoc and jump to a specified or hotspot event.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rdc_path": {
+                        "type": "string",
+                        "description": "Absolute path to .rdc file.",
+                    },
+                    "event_id": {
+                        "type": "integer",
+                        "description": "Target eventId to jump to. If omitted, picks hotspot by rank.",
+                    },
+                    "hotspot_rank": {
+                        "type": "integer",
+                        "description": "When event_id omitted, choose this hotspot rank (1-based).",
+                        "default": 1,
+                    },
+                    "hotspot_top_n": {
+                        "type": "integer",
+                        "description": "Hotspot pool size used for auto-pick.",
+                        "default": 12,
+                    },
+                    "renderdoc_dir": {
+                        "type": "string",
+                        "description": "Directory containing qrenderdoc.exe. Defaults to script parent root.",
+                    },
+                    "show_event_browser": {
+                        "type": "boolean",
+                        "description": "Show Event Browser after jump.",
+                        "default": True,
+                    },
+                    "keep_qrenderdoc_open": {
+                        "type": "boolean",
+                        "description": "Keep qrenderdoc window open after focus action.",
+                        "default": True,
+                    },
+                    "persist_context": {
+                        "type": "boolean",
+                        "description": "Persist focused-event context summary to analysis folder.",
+                        "default": True,
+                    },
+                    "context_top_n": {
+                        "type": "integer",
+                        "description": "Top-N rows used to build focused-event context.",
+                        "default": 24,
+                    },
+                    "save_root_dir": {
+                        "type": "string",
+                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                    },
+                },
+                "required": ["rdc_path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "analyze_event",
+            "description": "Analyze one specific event in an .rdc and export related textures/context for diagnosis.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rdc_path": {
+                        "type": "string",
+                        "description": "Absolute path to .rdc file.",
+                    },
+                    "event_id": {
+                        "type": "integer",
+                        "description": "Target eventId to analyze.",
+                    },
+                    "renderdoc_dir": {
+                        "type": "string",
+                        "description": "Directory containing qrenderdoc.exe. Defaults to script parent root.",
+                    },
+                    "save_root_dir": {
+                        "type": "string",
+                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                    },
+                    "export_images": {
+                        "type": "boolean",
+                        "description": "Export input/output textures to PNG.",
+                        "default": True,
+                    },
+                },
+                "required": ["rdc_path", "event_id"],
                 "additionalProperties": False,
             },
         },
@@ -549,6 +648,10 @@ with open(result_path, "w", encoding="utf-8") as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
 """
     script_path.write_text(script, encoding="utf-8")
+    try:
+        (event_dir / "_debug_analyze_event_script.py").write_text(script, encoding="utf-8")
+    except Exception:
+        pass
 
     proc = subprocess.Popen(
         [str(qrenderdoc), "--python", str(script_path)],
@@ -601,11 +704,323 @@ with open(result_path, "w", encoding="utf-8") as f:
     return details
 
 
+def _default_analysis_save_root() -> Path:
+    return Path.home() / "Desktop" / "RENDERDOC-MCP-SAVE"
+
+
+def _safe_dir_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("._")
+    return cleaned or "capture"
+
+
+def _build_texture_lookup(result: Dict[str, Any], top_n: int) -> List[Dict[str, Any]]:
+    hotspot_rows = result.get("hotspots", {}).get("topByGpuDuration", []) or []
+    duration_by_event: Dict[int, float] = {}
+    for row in hotspot_rows:
+        try:
+            duration_by_event[int(row.get("eventId", 0))] = float(row.get("gpuDuration_us", 0.0))
+        except Exception:
+            continue
+
+    usage_count_hint: Dict[str, int] = {}
+    for row in result.get("textures", {}).get("topByUsageCount", []) or []:
+        rid = str(row.get("resourceId", ""))
+        if rid:
+            try:
+                usage_count_hint[rid] = int(row.get("usageCount", 0))
+            except Exception:
+                usage_count_hint[rid] = 0
+
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for row in result.get("pipeline_trace", []) or []:
+        try:
+            event_id = int(row.get("eventId", 0))
+        except Exception:
+            event_id = 0
+        for sampled in row.get("psSampledResources", []) or []:
+            rid = str(sampled.get("resourceId", ""))
+            if not rid:
+                continue
+            one = lookup.setdefault(
+                rid,
+                {
+                    "resourceId": rid,
+                    "name": sampled.get("name", ""),
+                    "sampledByEvents": set(),
+                    "outputByEvents": set(),
+                    "maxGpuDuration_us": 0.0,
+                    "usageCountHint": usage_count_hint.get(rid),
+                },
+            )
+            one["sampledByEvents"].add(event_id)
+            one["maxGpuDuration_us"] = max(one["maxGpuDuration_us"], duration_by_event.get(event_id, 0.0))
+        for out in row.get("outputTargets", []) or []:
+            rid = str(out.get("resourceId", ""))
+            if not rid:
+                continue
+            one = lookup.setdefault(
+                rid,
+                {
+                    "resourceId": rid,
+                    "name": out.get("name", ""),
+                    "sampledByEvents": set(),
+                    "outputByEvents": set(),
+                    "maxGpuDuration_us": 0.0,
+                    "usageCountHint": usage_count_hint.get(rid),
+                },
+            )
+            one["outputByEvents"].add(event_id)
+            one["maxGpuDuration_us"] = max(one["maxGpuDuration_us"], duration_by_event.get(event_id, 0.0))
+
+    rows: List[Dict[str, Any]] = []
+    for _, one in lookup.items():
+        sampled_events = sorted([int(x) for x in one["sampledByEvents"] if int(x) > 0])
+        output_events = sorted([int(x) for x in one["outputByEvents"] if int(x) > 0])
+        rows.append(
+            {
+                "resourceId": one["resourceId"],
+                "name": one.get("name", ""),
+                "sampledByEventIds": sampled_events,
+                "outputByEventIds": output_events,
+                "hotspotEventIds": sorted(set(sampled_events + output_events)),
+                "maxGpuDuration_us": round(float(one.get("maxGpuDuration_us", 0.0)), 3),
+                "usageCountHint": one.get("usageCountHint"),
+            }
+        )
+
+    rows.sort(
+        key=lambda x: (
+            x.get("maxGpuDuration_us", 0.0),
+            len(x.get("hotspotEventIds", [])),
+            len(x.get("sampledByEventIds", [])),
+        ),
+        reverse=True,
+    )
+    return rows[: max(top_n * 4, top_n)]
+
+
+def _render_analysis_html(result: Dict[str, Any], texture_lookup: List[Dict[str, Any]]) -> str:
+    flow = result.get("flow", {}) or {}
+    hotspots = result.get("hotspots", {}).get("topByGpuDuration", []) or []
+    traces = result.get("pipeline_trace", []) or []
+    algorithms = result.get("algorithms", {}).get("hints", []) or []
+
+    def _table(headers: List[str], rows: List[List[str]]) -> str:
+        thead = "".join(f"<th>{escape(h)}</th>" for h in headers)
+        body_rows = []
+        for row in rows:
+            body_rows.append("<tr>" + "".join(f"<td>{escape(str(c))}</td>" for c in row) + "</tr>")
+        tbody = "".join(body_rows) if body_rows else "<tr><td colspan='99'>No data</td></tr>"
+        return f"<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>"
+
+    hotspot_rows = [
+        [
+            str(x.get("eventId", "")),
+            str(x.get("gpuDuration_us", "")),
+            str(x.get("numIndices", "")),
+            str(x.get("numInstances", "")),
+            str(x.get("name", "")),
+        ]
+        for x in hotspots
+    ]
+    texture_rows = [
+        [
+            str(x.get("resourceId", "")),
+            str(x.get("usageCount", "")),
+            str(x.get("width", "")),
+            str(x.get("height", "")),
+            str(x.get("format", "")),
+            str(x.get("name", "")),
+        ]
+        for x in (result.get("textures", {}).get("topByUsageCount", []) or [])
+    ]
+    lookup_rows = [
+        [
+            str(x.get("resourceId", "")),
+            str(x.get("maxGpuDuration_us", "")),
+            ",".join(str(i) for i in x.get("hotspotEventIds", [])),
+            ",".join(str(i) for i in x.get("sampledByEventIds", [])),
+            ",".join(str(i) for i in x.get("outputByEventIds", [])),
+            str(x.get("name", "")),
+        ]
+        for x in texture_lookup
+    ]
+    trace_rows = []
+    for row in traces:
+        ps_inputs = ",".join(str(x.get("resourceId", "")) for x in row.get("psSampledResources", []) or [])
+        outputs = ",".join(str(x.get("resourceId", "")) for x in row.get("outputTargets", []) or [])
+        trace_rows.append(
+            [
+                str(row.get("eventId", "")),
+                str((row.get("vs", {}) or {}).get("id", "")),
+                str((row.get("ps", {}) or {}).get("id", "")),
+                ps_inputs,
+                outputs,
+            ]
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RenderDoc MCP Analysis</title>
+  <style>
+    :root {{
+      --bg: #f3f7fa;
+      --card: #ffffff;
+      --text: #12212f;
+      --muted: #5f7283;
+      --line: #d7e0e7;
+      --accent: #0b6d7a;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: "Segoe UI", "Noto Sans SC", sans-serif; background: var(--bg); color: var(--text); }}
+    .wrap {{ max-width: 1280px; margin: 0 auto; padding: 20px; }}
+    .hero {{ background: linear-gradient(120deg, #dceff2, #f6fbff); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 16px; }}
+    .hero h1 {{ margin: 0 0 6px; font-size: 22px; }}
+    .muted {{ color: var(--muted); font-size: 13px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 10px; }}
+    .kpi {{ background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }}
+    .kpi b {{ font-size: 18px; display: block; margin-top: 4px; }}
+    .card {{ background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 12px; overflow: auto; }}
+    h2 {{ margin: 0 0 8px; font-size: 16px; color: var(--accent); }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    th, td {{ border-bottom: 1px solid #e8eef3; text-align: left; padding: 7px 6px; vertical-align: top; }}
+    th {{ position: sticky; top: 0; background: #f7fbff; z-index: 1; }}
+    ul {{ margin: 6px 0 0 18px; padding: 0; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <h1>RenderDoc MCP Analysis</h1>
+      <div class="muted">{escape(str(result.get("rdc_path", "")))}</div>
+      <div class="grid">
+        <div class="kpi">Pipeline<b>{escape(str(result.get("pipeline", "")))}</b></div>
+        <div class="kpi">Events<b>{escape(str(flow.get("eventCount", 0)))}</b></div>
+        <div class="kpi">Draws<b>{escape(str(flow.get("drawCount", 0)))}</b></div>
+        <div class="kpi">Begin/EndPass<b>{escape(str(flow.get("beginPassCount", 0)))}/{escape(str(flow.get("endPassCount", 0)))}</b></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Algorithm Hints</h2>
+      <ul>{"".join(f"<li>{escape(str(x))}</li>" for x in algorithms) or "<li>No hint</li>"}</ul>
+    </div>
+
+    <div class="card">
+      <h2>Top GPU Hotspots</h2>
+      {_table(["eventId", "gpuDuration_us", "numIndices", "numInstances", "name"], hotspot_rows)}
+    </div>
+
+    <div class="card">
+      <h2>Top Texture Usage</h2>
+      {_table(["resourceId", "usageCount", "width", "height", "format", "name"], texture_rows)}
+    </div>
+
+    <div class="card">
+      <h2>Texture To Hotspot Mapping</h2>
+      {_table(["resourceId", "maxGpuDuration_us", "hotspotEventIds", "sampledByEventIds", "outputByEventIds", "name"], lookup_rows)}
+    </div>
+
+    <div class="card">
+      <h2>Pipeline Trace (Hot Events)</h2>
+      {_table(["eventId", "vsShaderId", "psShaderId", "psSampledResources", "outputTargets"], trace_rows)}
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def _render_event_analysis_html(payload: Dict[str, Any]) -> str:
+    event = payload.get("event", {}) or {}
+    pipeline = payload.get("pipeline", {}) or {}
+    stats = payload.get("stats", {}) or {}
+    analysis = payload.get("analysis", {}) or {}
+    resources = payload.get("resources", []) or []
+
+    def _table(headers: List[str], rows: List[List[str]]) -> str:
+        thead = "".join(f"<th>{escape(h)}</th>" for h in headers)
+        body = "".join(
+            "<tr>" + "".join(f"<td>{escape(str(c))}</td>" for c in row) + "</tr>"
+            for row in rows
+        ) or "<tr><td colspan='99'>No data</td></tr>"
+        return f"<table><thead><tr>{thead}</tr></thead><tbody>{body}</tbody></table>"
+
+    res_rows = [
+        [
+            str(r.get("kind", "")),
+            str(r.get("slot", "")),
+            str(r.get("resourceId", "")),
+            str(r.get("name", "")),
+            str(r.get("imagePath", "")),
+            str(r.get("saveTextureResult", "")),
+        ]
+        for r in resources
+    ]
+    reason_items = "".join(f"<li>{escape(str(x))}</li>" for x in (analysis.get("reasons", []) or [])) or "<li>无</li>"
+    suggestion_items = "".join(f"<li>{escape(str(x))}</li>" for x in (analysis.get("suggestions", []) or [])) or "<li>无</li>"
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Event Analysis</title>
+  <style>
+    body {{ font-family: "Segoe UI","Noto Sans SC",sans-serif; margin: 0; background: #f4f8fb; color: #15202b; }}
+    .wrap {{ max-width: 1100px; margin: 0 auto; padding: 18px; }}
+    .card {{ background: #fff; border: 1px solid #dbe5ee; border-radius: 12px; padding: 12px; margin-bottom: 12px; }}
+    .kpi {{ display: grid; grid-template-columns: repeat(auto-fit,minmax(170px,1fr)); gap: 10px; }}
+    .kpi div {{ background: #f8fbff; border: 1px solid #e3edf5; border-radius: 10px; padding: 8px; }}
+    h1 {{ margin: 0 0 10px; font-size: 22px; }}
+    h2 {{ margin: 0 0 8px; font-size: 16px; color: #0f6674; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    th, td {{ border-bottom: 1px solid #edf2f7; text-align: left; padding: 7px 6px; vertical-align: top; }}
+    th {{ background: #f8fbff; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>事件分析 Event {escape(str(event.get("eventId", "")))}</h1>
+      <div>{escape(str(payload.get("rdc_path", "")))}</div>
+    </div>
+    <div class="card kpi">
+      <div>DrawCall<br><b>{escape(str(event.get("drawcall", "")))}</b></div>
+      <div>GPU Duration(us)<br><b>{escape(str(stats.get("gpuDuration_us", "")))}</b></div>
+      <div>numIndices<br><b>{escape(str(event.get("numIndices", "")))}</b></div>
+      <div>numInstances<br><b>{escape(str(event.get("numInstances", "")))}</b></div>
+      <div>Hotspot Rank<br><b>{escape(str(stats.get("hotspotRank", "")))}</b></div>
+    </div>
+    <div class="card">
+      <h2>Pipeline</h2>
+      <div>VS: {escape(str((pipeline.get("vs", {}) or {}).get("id", "")))} / {escape(str((pipeline.get("vs", {}) or {}).get("entry", "")))}</div>
+      <div>PS: {escape(str((pipeline.get("ps", {}) or {}).get("id", "")))} / {escape(str((pipeline.get("ps", {}) or {}).get("entry", "")))}</div>
+    </div>
+    <div class="card">
+      <h2>原因</h2>
+      <ul>{reason_items}</ul>
+      <h2>建议</h2>
+      <ul>{suggestion_items}</ul>
+    </div>
+    <div class="card">
+      <h2>相关资源</h2>
+      {_table(["kind", "slot", "resourceId", "name", "imagePath", "saveResult"], res_rows)}
+    </div>
+  </div>
+</body>
+</html>"""
+
+
 def _analyze_rdc_with_qrenderdoc(
     qrenderdoc: Path,
     rdc_path: Path,
     top_n: int = 12,
     save_json: bool = True,
+    save_root_dir: Optional[Path] = None,
+    open_report: bool = True,
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "rdc_path": str(rdc_path),
@@ -615,9 +1030,14 @@ def _analyze_rdc_with_qrenderdoc(
         "hotspots": {},
         "textures": {},
         "pipeline_trace": [],
+        "resource_map": {},
         "algorithms": {},
+        "texture_lookup": [],
         "errors": [],
         "analysis_json": None,
+        "analysis_dir": None,
+        "analysis_files": {},
+        "report_path": None,
     }
     if not qrenderdoc.exists():
         raise ValueError(f"qrenderdoc.exe not found: {qrenderdoc}")
@@ -632,13 +1052,20 @@ def _analyze_rdc_with_qrenderdoc(
     log_path = run_dir / "analyze.log"
     top_n = max(int(top_n), 1)
 
-    output_json = rdc_path.with_suffix(".analysis.json")
+    output_json: Optional[Path] = None
+    analysis_dir: Optional[Path] = None
+    if save_json:
+        root = (save_root_dir or _default_analysis_save_root()).expanduser().resolve()
+        analysis_dir = root / _safe_dir_name(rdc_path.stem)
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        output_json = analysis_dir / "analysis.full.json"
+
     cfg = {
         "rdc_path": str(rdc_path),
         "result_path": str(result_path),
         "log_path": str(log_path),
         "top_n": top_n,
-        "persist_output_path": str(output_json) if save_json else "",
+        "persist_output_path": str(output_json) if output_json else "",
     }
     cfg_json = json.dumps(cfg, ensure_ascii=True)
     script = f"""import json
@@ -664,6 +1091,7 @@ res = {{
     "hotspots": {{}},
     "textures": {{}},
     "pipeline_trace": [],
+    "resource_map": {{}},
     "algorithms": {{}},
     "errors": [],
 }}
@@ -685,6 +1113,7 @@ try:
     rmap = {{}}
     for r in ctrl.GetResources():
         rmap[str(r.resourceId)] = str(r.name)
+    res["resource_map"] = rmap
 
     roots = list(ctrl.GetRootActions())
     queue = roots[:]
@@ -903,9 +1332,473 @@ if persist_output_path:
     else:
         result["errors"].append("analyze result file not produced")
 
-    if save_json:
-        result["analysis_json"] = str(output_json)
+    texture_lookup = _build_texture_lookup(result, top_n=top_n)
+    result["texture_lookup"] = texture_lookup
+
+    if save_json and analysis_dir is not None:
+        artifacts: Dict[str, Path] = {
+            "analysis.full.json": analysis_dir / "analysis.full.json",
+            "flow.json": analysis_dir / "flow.json",
+            "hotspots.json": analysis_dir / "hotspots.json",
+            "textures.json": analysis_dir / "textures.json",
+            "pipeline_trace.json": analysis_dir / "pipeline_trace.json",
+            "resource_map.json": analysis_dir / "resource_map.json",
+            "texture_lookup.json": analysis_dir / "texture_lookup.json",
+            "algorithms.json": analysis_dir / "algorithms.json",
+            "errors.json": analysis_dir / "errors.json",
+            "report.html": analysis_dir / "report.html",
+        }
+        artifacts["analysis.full.json"].write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["flow.json"].write_text(
+            json.dumps(result.get("flow", {}), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["hotspots.json"].write_text(
+            json.dumps(result.get("hotspots", {}), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["textures.json"].write_text(
+            json.dumps(result.get("textures", {}), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["pipeline_trace.json"].write_text(
+            json.dumps(result.get("pipeline_trace", []), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["resource_map.json"].write_text(
+            json.dumps(result.get("resource_map", {}), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["texture_lookup.json"].write_text(
+            json.dumps(texture_lookup, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["algorithms.json"].write_text(
+            json.dumps(result.get("algorithms", {}), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        artifacts["errors.json"].write_text(
+            json.dumps(result.get("errors", []), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        html = _render_analysis_html(result=result, texture_lookup=texture_lookup)
+        artifacts["report.html"].write_text(html, encoding="utf-8")
+
+        result["analysis_json"] = str(artifacts["analysis.full.json"])
+        result["analysis_dir"] = str(analysis_dir)
+        result["report_path"] = str(artifacts["report.html"])
+        result["analysis_files"] = {k: str(v) for k, v in artifacts.items()}
+
+        if open_report:
+            try:
+                os.startfile(str(artifacts["report.html"]))  # type: ignore[attr-defined]
+            except Exception as exc:
+                result["errors"].append(f"open report failed: {exc}")
     return result
+
+
+def _focus_rdc_event_with_qrenderdoc(
+    qrenderdoc: Path,
+    rdc_path: Path,
+    event_id: int,
+    show_event_browser: bool = True,
+    keep_qrenderdoc_open: bool = True,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "ok": False,
+        "rdc_path": str(rdc_path),
+        "requested_event_id": int(event_id),
+        "jumped_event_id": None,
+        "capture_loaded": False,
+        "already_loaded": False,
+        "loaded_capture": None,
+        "qrenderdoc_pid": None,
+        "log_path": None,
+        "error": None,
+    }
+    if not qrenderdoc.exists():
+        raise ValueError(f"qrenderdoc.exe not found: {qrenderdoc}")
+    if not rdc_path.exists():
+        raise ValueError(f"rdc_path not found: {rdc_path}")
+    if rdc_path.suffix.lower() != ".rdc":
+        raise ValueError(f"rdc_path must be .rdc: {rdc_path}")
+    if int(event_id) <= 0:
+        raise ValueError("event_id must be > 0")
+
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_focus_"))
+    script_path = run_dir / "focus_event.py"
+    result_path = run_dir / "focus_event_result.json"
+    log_path = run_dir / "focus_event.log"
+    result["log_path"] = str(log_path)
+
+    cfg = {
+        "rdc_path": str(rdc_path),
+        "event_id": int(event_id),
+        "result_path": str(result_path),
+        "log_path": str(log_path),
+        "show_event_browser": bool(show_event_browser),
+    }
+    cfg_json = json.dumps(cfg, ensure_ascii=True)
+    script = f"""import json
+import os
+import time
+import traceback
+
+cfg = json.loads({json.dumps(cfg_json)})
+rdc_path = os.path.abspath(cfg["rdc_path"])
+event_id = int(cfg["event_id"])
+result_path = cfg["result_path"]
+log_path = cfg["log_path"]
+show_event_browser = bool(cfg["show_event_browser"])
+
+def _norm(p):
+    return os.path.normcase(os.path.abspath(str(p))).replace("/", "\\\\")
+
+def _log(msg):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{{time.strftime('%H:%M:%S')}}] {{msg}}\\n")
+
+res = {{
+    "ok": False,
+    "requested_event_id": event_id,
+    "jumped_event_id": None,
+    "capture_loaded": False,
+    "already_loaded": False,
+    "loaded_capture": "",
+    "error": None,
+}}
+
+try:
+    import renderdoc as rd
+    ctx = pyrenderdoc
+    cur_path = ""
+    if ctx.IsCaptureLoaded():
+        cur_path = str(ctx.GetCaptureFilename() or "")
+    _log(f"current capture: {{cur_path}}")
+
+    if ctx.IsCaptureLoaded() and _norm(cur_path) == _norm(rdc_path):
+        res["already_loaded"] = True
+    else:
+        ctx.LoadCapture(rdc_path, rd.ReplayOptions(), rdc_path, False, True)
+        deadline = time.time() + 45.0
+        while ctx.IsCaptureLoading() and time.time() < deadline:
+            time.sleep(0.1)
+        if ctx.IsCaptureLoading():
+            raise RuntimeError("timeout waiting for capture load")
+    if not ctx.IsCaptureLoaded():
+        raise RuntimeError("capture not loaded")
+    res["capture_loaded"] = True
+    res["loaded_capture"] = str(ctx.GetCaptureFilename() or "")
+
+    # clamp to valid action range if needed
+    first_a = ctx.GetFirstAction()
+    last_a = ctx.GetLastAction()
+    first_e = int(first_a.eventId) if first_a else 1
+    last_e = int(last_a.eventId) if last_a else event_id
+    target = max(first_e, min(event_id, last_e))
+    ctx.SetEventID([], target, target, True)
+    time.sleep(0.05)
+    jumped = int(ctx.CurEvent())
+    res["jumped_event_id"] = jumped
+
+    if show_event_browser:
+        try:
+            ctx.ShowEventBrowser()
+        except Exception as e:
+            _log(f"ShowEventBrowser failed: {{e}}")
+
+    if jumped <= 0:
+        raise RuntimeError("jump failed, current event invalid")
+    res["ok"] = True
+except Exception:
+    res["error"] = traceback.format_exc()
+
+with open(result_path, "w", encoding="utf-8") as f:
+    json.dump(res, f, ensure_ascii=False, indent=2)
+"""
+    script_path.write_text(script, encoding="utf-8")
+
+    proc = subprocess.Popen(
+        [str(qrenderdoc), "--python", str(script_path)],
+        cwd=str(qrenderdoc.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    result["qrenderdoc_pid"] = int(proc.pid)
+    deadline = time.time() + 65
+    while time.time() < deadline:
+        if result_path.exists():
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    if proc.poll() is None and (not keep_qrenderdoc_open):
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    if result_path.exists():
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        result.update(payload)
+        if keep_qrenderdoc_open:
+            try:
+                _set_foreground_for_process_name("qrenderdoc.exe")
+            except Exception:
+                pass
+    else:
+        out = (proc.stdout.read() if proc.stdout else "").strip()
+        err = (proc.stderr.read() if proc.stderr else "").strip()
+        result["error"] = "focus result file not produced"
+        if out:
+            result["stdout"] = out
+        if err:
+            result["stderr"] = err
+
+    return result
+
+
+def _build_focus_event_context(
+    analysis: Dict[str, Any], selected_event_id: int
+) -> Dict[str, Any]:
+    hotspots = analysis.get("hotspots", {}).get("topByGpuDuration", []) or []
+    pipeline_trace = analysis.get("pipeline_trace", []) or []
+    texture_lookup = analysis.get("texture_lookup", []) or []
+
+    focus_hotspot = None
+    hotspot_rank = None
+    for i, row in enumerate(hotspots, start=1):
+        try:
+            if int(row.get("eventId", 0)) == int(selected_event_id):
+                focus_hotspot = row
+                hotspot_rank = i
+                break
+        except Exception:
+            continue
+
+    focus_trace = None
+    for row in pipeline_trace:
+        try:
+            if int(row.get("eventId", 0)) == int(selected_event_id):
+                focus_trace = row
+                break
+        except Exception:
+            continue
+
+    related_textures: List[Dict[str, Any]] = []
+    for row in texture_lookup:
+        events = row.get("hotspotEventIds", []) or []
+        try:
+            if int(selected_event_id) in [int(x) for x in events]:
+                related_textures.append(row)
+        except Exception:
+            continue
+    related_textures.sort(
+        key=lambda x: (float(x.get("maxGpuDuration_us", 0.0)), len(x.get("hotspotEventIds", []) or [])),
+        reverse=True,
+    )
+    related_textures = related_textures[:20]
+
+    hints: List[str] = []
+    if focus_hotspot:
+        dur = float(focus_hotspot.get("gpuDuration_us", 0.0))
+        idx = int(focus_hotspot.get("numIndices", 0))
+        inst = int(focus_hotspot.get("numInstances", 0))
+        if dur >= 500:
+            hints.append("单次 Draw 的 GPU 时长较高，优先从像素着色开销和带宽压力排查。")
+        if idx <= 12 and dur > 200:
+            hints.append("几何量很小但耗时高，常见于全屏后处理/复杂材质，建议先看 PS 指令与采样数。")
+        if inst > 1 and dur > 200:
+            hints.append("存在实例化开销，建议检查每实例数据读取与分支。")
+    if focus_trace:
+        sampled_count = len(focus_trace.get("psSampledResources", []) or [])
+        if sampled_count >= 8:
+            hints.append("PS 采样纹理数量较多，可尝试降采样、合并贴图或减少多重采样路径。")
+        outputs_count = len(focus_trace.get("outputTargets", []) or [])
+        if outputs_count >= 3:
+            hints.append("输出目标较多（MRT），可评估是否能减少写出通道或拆分 pass。")
+    if not hints:
+        hints.append("建议先对该事件做 shader 指令级分析（ALU/TEX 比例）和过绘检查。")
+
+    return {
+        "eventId": int(selected_event_id),
+        "hotspotRank": hotspot_rank,
+        "hotspot": focus_hotspot,
+        "pipelineTrace": focus_trace,
+        "relatedTextures": related_textures,
+        "optimizationHints": hints,
+    }
+
+
+def _write_focus_context_files(
+    analysis_dir: Path, focus_ctx: Dict[str, Any], rdc_path: Path
+) -> Dict[str, str]:
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    eid = int(focus_ctx.get("eventId", 0))
+    json_path = analysis_dir / f"focus_event_{eid}.json"
+    md_path = analysis_dir / f"focus_event_{eid}.md"
+    json_path.write_text(json.dumps(focus_ctx, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    hs = focus_ctx.get("hotspot") or {}
+    trace = focus_ctx.get("pipelineTrace") or {}
+    rel_tex = focus_ctx.get("relatedTextures", []) or []
+    hints = focus_ctx.get("optimizationHints", []) or []
+    lines = [
+        f"# Focus Event {eid}",
+        "",
+        f"- rdc: `{rdc_path}`",
+        f"- hotspotRank: `{focus_ctx.get('hotspotRank')}`",
+        f"- gpuDuration_us: `{hs.get('gpuDuration_us')}`",
+        f"- drawName: `{hs.get('name')}`",
+        f"- numIndices: `{hs.get('numIndices')}`",
+        f"- numInstances: `{hs.get('numInstances')}`",
+        "",
+        "## Pipeline",
+        "",
+        f"- vs: `{((trace.get('vs') or {}).get('id'))}`",
+        f"- ps: `{((trace.get('ps') or {}).get('id'))}`",
+        f"- psSampledCount: `{len(trace.get('psSampledResources', []) or [])}`",
+        f"- outputTargetCount: `{len(trace.get('outputTargets', []) or [])}`",
+        "",
+        "## Related Textures (Top)",
+        "",
+    ]
+    for one in rel_tex[:10]:
+        lines.append(
+            f"- `{one.get('resourceId')}` | maxGpuDuration_us={one.get('maxGpuDuration_us')} | hotspotEvents={one.get('hotspotEventIds')}"
+        )
+    lines.extend(["", "## Optimization Hints", ""])
+    for h in hints:
+        lines.append(f"- {h}")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        "focus_json": str(json_path),
+        "focus_markdown": str(md_path),
+    }
+
+
+def _analyze_event_with_qrenderdoc(
+    qrenderdoc: Path,
+    rdc_path: Path,
+    event_id: int,
+    save_root_dir: Optional[Path] = None,
+    export_images: bool = True,
+) -> Dict[str, Any]:
+    if not qrenderdoc.exists():
+        raise ValueError(f"qrenderdoc.exe not found: {qrenderdoc}")
+    if not rdc_path.exists():
+        raise ValueError(f"rdc_path not found: {rdc_path}")
+    if rdc_path.suffix.lower() != ".rdc":
+        raise ValueError(f"rdc_path must be .rdc: {rdc_path}")
+    if int(event_id) <= 0:
+        raise ValueError("event_id must be > 0")
+
+    root = (save_root_dir or _default_analysis_save_root()).expanduser().resolve()
+    event_dir = root / _safe_dir_name(rdc_path.stem) / f"event_{int(event_id)}"
+    event_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = event_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stability mode: reuse the proven analyzer path to avoid qrenderdoc crash popups.
+    analysis = _analyze_rdc_with_qrenderdoc(
+        qrenderdoc=qrenderdoc,
+        rdc_path=rdc_path,
+        top_n=96,
+        save_json=True,
+        save_root_dir=root,
+        open_report=False,
+    )
+    focus_ctx = _build_focus_event_context(analysis, int(event_id))
+    hotspot = focus_ctx.get("hotspot") or {}
+    trace = focus_ctx.get("pipelineTrace") or {}
+
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "rdc_path": str(rdc_path),
+        "event_id": int(event_id),
+        "event": {
+            "eventId": int(event_id),
+            "drawcall": hotspot.get("name", ""),
+            "numIndices": hotspot.get("numIndices"),
+            "numInstances": hotspot.get("numInstances"),
+        },
+        "pipeline": {
+            "vs": (trace.get("vs") or {}),
+            "ps": (trace.get("ps") or {}),
+        },
+        "resources": [],
+        "stats": {
+            "gpuDuration_us": hotspot.get("gpuDuration_us"),
+            "hotspotRank": focus_ctx.get("hotspotRank"),
+        },
+        "analysis": {
+            "reasons": focus_ctx.get("optimizationHints", []),
+            "suggestions": [
+                "Compare this event against adjacent hotspot events to detect redundant post-process passes.",
+                "In Texture Viewer, reduce Range and inspect single channels/A channel to avoid false black-white interpretation.",
+            ],
+        },
+        "errors": analysis.get("errors", []),
+        "note": "stability mode: image export is temporarily disabled to avoid qrenderdoc crash loops",
+    }
+
+    for one in (trace.get("psSampledResources", []) or []):
+        payload["resources"].append(
+            {
+                "kind": "ps_sampled",
+                "slot": one.get("slot"),
+                "resourceId": one.get("resourceId"),
+                "name": one.get("name"),
+                "imagePath": None,
+                "saveTextureResult": "skipped_stability_mode",
+            }
+        )
+    for idx, one in enumerate(trace.get("outputTargets", []) or []):
+        payload["resources"].append(
+            {
+                "kind": "output",
+                "slot": idx,
+                "resourceId": one.get("resourceId"),
+                "name": one.get("name"),
+                "imagePath": None,
+                "saveTextureResult": "skipped_stability_mode",
+            }
+        )
+
+    json_path = event_dir / "event_analysis.json"
+    md_path = event_dir / "event_analysis.md"
+    html_path = event_dir / "event_analysis.html"
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lines = [
+        f"# Event Analysis {event_id}",
+        "",
+        f"- rdc: `{rdc_path}`",
+        f"- eventId: `{payload.get('event', {}).get('eventId')}`",
+        f"- drawcall: `{payload.get('event', {}).get('drawcall')}`",
+        f"- gpuDuration_us: `{payload.get('stats', {}).get('gpuDuration_us')}`",
+        "",
+        "## Reasons",
+        "",
+    ]
+    for x in payload.get("analysis", {}).get("reasons", []) or []:
+        lines.append(f"- {x}")
+    lines.extend(["", "## Suggestions", ""])
+    for x in payload.get("analysis", {}).get("suggestions", []) or []:
+        lines.append(f"- {x}")
+    lines.extend(["", "## Resources", ""])
+    for r in payload.get("resources", []) or []:
+        lines.append(
+            f"- {r.get('kind')} slot={r.get('slot')} rid={r.get('resourceId')} image={r.get('imagePath')} saveResult={r.get('saveTextureResult')}"
+        )
+    md_path.write_text("\\n".join(lines) + "\\n", encoding="utf-8")
+    html_path.write_text(_render_event_analysis_html(payload), encoding="utf-8")
+
+    payload["event_dir"] = str(event_dir)
+    payload["event_files"] = {
+        "event_analysis_json": str(json_path),
+        "event_analysis_md": str(md_path),
+        "event_analysis_html": str(html_path),
+        "images_dir": str(images_dir),
+    }
+    return payload
 
 
 def _find_pid_by_name(process_name: str) -> Optional[int]:
@@ -1300,14 +2193,134 @@ def _analyze_rdc(args: Dict[str, Any]) -> Dict[str, Any]:
     rdc_path = Path(str(rdc_path_arg)).expanduser().resolve()
     top_n = int(args.get("top_n", 12))
     save_json = bool(args.get("save_json", True))
+    open_report = bool(args.get("open_report", True))
+    save_root_dir_arg = args.get("save_root_dir")
+    save_root_dir = (
+        Path(str(save_root_dir_arg)).expanduser().resolve()
+        if save_root_dir_arg
+        else _default_analysis_save_root()
+    )
     _renderdoccmd, qrenderdoc = _resolve_renderdoc_paths(args.get("renderdoc_dir"))
     data = _analyze_rdc_with_qrenderdoc(
         qrenderdoc=qrenderdoc,
         rdc_path=rdc_path,
         top_n=top_n,
         save_json=save_json,
+        save_root_dir=save_root_dir,
+        open_report=open_report,
     )
     return data
+
+
+def _focus_rdc_event(args: Dict[str, Any]) -> Dict[str, Any]:
+    rdc_path_arg = args.get("rdc_path")
+    if not rdc_path_arg:
+        raise ValueError("rdc_path is required")
+    rdc_path = Path(str(rdc_path_arg)).expanduser().resolve()
+    event_id_arg = args.get("event_id")
+    hotspot_rank = max(int(args.get("hotspot_rank", 1)), 1)
+    hotspot_top_n = max(int(args.get("hotspot_top_n", 12)), 1)
+    context_top_n = max(int(args.get("context_top_n", 24)), 1)
+    show_event_browser = bool(args.get("show_event_browser", True))
+    keep_qrenderdoc_open = bool(args.get("keep_qrenderdoc_open", True))
+    persist_context = bool(args.get("persist_context", True))
+    save_root_dir_arg = args.get("save_root_dir")
+    save_root_dir = (
+        Path(str(save_root_dir_arg)).expanduser().resolve()
+        if save_root_dir_arg
+        else _default_analysis_save_root()
+    )
+    _renderdoccmd, qrenderdoc = _resolve_renderdoc_paths(args.get("renderdoc_dir"))
+
+    selected_event_id: Optional[int] = int(event_id_arg) if event_id_arg is not None else None
+    auto_pick: Dict[str, Any] = {}
+    context_analysis: Optional[Dict[str, Any]] = None
+    if selected_event_id is None:
+        analysis = _analyze_rdc_with_qrenderdoc(
+            qrenderdoc=qrenderdoc,
+            rdc_path=rdc_path,
+            top_n=max(hotspot_top_n, context_top_n),
+            save_json=True,
+            save_root_dir=save_root_dir,
+            open_report=False,
+        )
+        context_analysis = analysis
+        rows = analysis.get("hotspots", {}).get("topByGpuDuration", []) or []
+        idx = hotspot_rank - 1
+        if idx < 0 or idx >= len(rows):
+            raise ValueError(
+                f"hotspot_rank {hotspot_rank} out of range, available hotspot count: {len(rows)}"
+            )
+        pick = rows[idx]
+        selected_event_id = int(pick.get("eventId", 0))
+        auto_pick = {
+            "hotspot_rank": hotspot_rank,
+            "hotspot_event": pick,
+            "analysis_dir": analysis.get("analysis_dir"),
+            "report_path": analysis.get("report_path"),
+        }
+
+    if selected_event_id is None or selected_event_id <= 0:
+        raise ValueError("unable to determine target event_id")
+
+    focused = _focus_rdc_event_with_qrenderdoc(
+        qrenderdoc=qrenderdoc,
+        rdc_path=rdc_path,
+        event_id=selected_event_id,
+        show_event_browser=show_event_browser,
+        keep_qrenderdoc_open=keep_qrenderdoc_open,
+    )
+    focused["resolved_event_id"] = selected_event_id
+    if auto_pick:
+        focused["auto_pick"] = auto_pick
+
+    if persist_context:
+        if context_analysis is None:
+            context_analysis = _analyze_rdc_with_qrenderdoc(
+                qrenderdoc=qrenderdoc,
+                rdc_path=rdc_path,
+                top_n=context_top_n,
+                save_json=True,
+                save_root_dir=save_root_dir,
+                open_report=False,
+            )
+        focus_ctx = _build_focus_event_context(context_analysis, selected_event_id)
+        analysis_dir = context_analysis.get("analysis_dir")
+        if analysis_dir:
+            files = _write_focus_context_files(Path(str(analysis_dir)), focus_ctx, rdc_path=rdc_path)
+            focused["focus_context"] = focus_ctx
+            focused["focus_context_files"] = files
+        else:
+            focused["focus_context"] = focus_ctx
+            focused["focus_context_files"] = {}
+    return focused
+
+
+def _analyze_event(args: Dict[str, Any]) -> Dict[str, Any]:
+    rdc_path_arg = args.get("rdc_path")
+    if not rdc_path_arg:
+        raise ValueError("rdc_path is required")
+    event_id_arg = args.get("event_id")
+    if event_id_arg is None:
+        raise ValueError("event_id is required")
+
+    rdc_path = Path(str(rdc_path_arg)).expanduser().resolve()
+    event_id = int(event_id_arg)
+    export_images = bool(args.get("export_images", True))
+    save_root_dir_arg = args.get("save_root_dir")
+    save_root_dir = (
+        Path(str(save_root_dir_arg)).expanduser().resolve()
+        if save_root_dir_arg
+        else _default_analysis_save_root()
+    )
+    _renderdoccmd, qrenderdoc = _resolve_renderdoc_paths(args.get("renderdoc_dir"))
+    return _analyze_event_with_qrenderdoc(
+        qrenderdoc=qrenderdoc,
+        rdc_path=rdc_path,
+        event_id=event_id,
+        save_root_dir=save_root_dir,
+        export_images=export_images,
+    )
 
 
 def _text_result(data: Dict[str, Any], is_error: bool = False) -> Dict[str, Any]:
@@ -1353,6 +2366,10 @@ def main() -> None:
                     data = _capture_game(arguments)
                 elif name == "analyze_rdc":
                     data = _analyze_rdc(arguments)
+                elif name == "focus_rdc_event":
+                    data = _focus_rdc_event(arguments)
+                elif name == "analyze_event":
+                    data = _analyze_event(arguments)
                 else:
                     raise ValueError(f"Unknown tool: {name}")
                 if wants_response:
