@@ -22,8 +22,8 @@ class ExternalMCPProxy:
 
     def _candidate_python(self) -> Optional[Path]:
         candidates = [
-            Path(r"C:\Users\wepie\Desktop\_ext_renderdoc_trial\.venv313\Scripts\python.exe"),
-            Path(r"C:\Users\wepie\Desktop\_ext_linking_src\.venv313\Scripts\python.exe"),
+            Path(r"C:\Users\wepie\Desktop\RenderDoc-mcp\_ext_renderdoc_trial\.venv313\Scripts\python.exe"),
+            Path(r"C:\Users\wepie\Desktop\RenderDoc-mcp\_ext_linking_src\.venv313\Scripts\python.exe"),
         ]
         for c in candidates:
             if c.exists():
@@ -32,7 +32,7 @@ class ExternalMCPProxy:
 
     def _candidate_module_path(self) -> Optional[str]:
         candidates = [
-            Path(r"C:\Users\wepie\Desktop\_ext_renderdoc_trial\.venv313\Lib\site-packages\renderdoc_mcp\lib"),
+            Path(r"C:\Users\wepie\Desktop\RenderDoc-mcp\_ext_renderdoc_trial\.venv313\Lib\site-packages\renderdoc_mcp\lib"),
             Path(r"C:\Users\wepie\Desktop\RenderDoc-mcp"),
         ]
         for c in candidates:

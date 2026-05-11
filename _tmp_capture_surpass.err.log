@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "C:\Users\wepie\Desktop\RenderDoc-mcp\_tmp_capture_surpass.py", line 4, in <module>
+    import renderdoc_mcp_server as m
+  File "C:\Users\wepie\Desktop\RenderDoc-mcp\mcp\renderdoc_mcp_server.py", line 2, in <module>
+    import ctypes
+  File "C:\Program Files\Python311\Lib\ctypes\__init__.py", line 8, in <module>
+    from _ctypes import Union, Structure, Array
+ImportError: Module use of python36.dll conflicts with this version of Python.

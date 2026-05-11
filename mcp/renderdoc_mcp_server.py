@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 import ctypes
 import glob
 import importlib.util
@@ -297,7 +297,7 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                     },
                     "save_root_dir": {
                         "type": "string",
-                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                        "description": "Root directory for saved artifacts. Default: RenderDoc-mcp\\\\analysis",
                     },
                     "open_report": {
                         "type": "boolean",
@@ -359,7 +359,7 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                     },
                     "save_root_dir": {
                         "type": "string",
-                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                        "description": "Root directory for saved artifacts. Default: RenderDoc-mcp\\\\analysis",
                     },
                 },
                 "required": ["rdc_path"],
@@ -386,7 +386,7 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                     },
                     "save_root_dir": {
                         "type": "string",
-                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                        "description": "Root directory for saved artifacts. Default: RenderDoc-mcp\\\\analysis",
                     },
                     "export_images": {
                         "type": "boolean",
@@ -412,7 +412,7 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                     },
                     "save_root_dir": {
                         "type": "string",
-                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                        "description": "Root directory for saved artifacts. Default: RenderDoc-mcp\\\\analysis",
                     },
                 },
                 "required": ["rdc_path", "event_id"],
@@ -434,7 +434,7 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                     },
                     "save_root_dir": {
                         "type": "string",
-                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                        "description": "Root directory for saved artifacts. Default: RenderDoc-mcp\\\\analysis",
                     },
                 },
                 "required": ["rdc_path", "event_a", "event_b"],
@@ -805,7 +805,7 @@ with open(result_path, "w", encoding="utf-8") as f:
 
 
 def _default_analysis_save_root() -> Path:
-    return Path.home() / "Desktop" / "RENDERDOC-MCP-SAVE"
+    return Path.home() / "Desktop" / "RenderDoc-mcp" / "analysis"
 
 
 def _safe_dir_name(name: str) -> str:
@@ -2768,6 +2768,8 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
 
     trigger_note = "auto_trigger disabled"
     trigger_details: Dict[str, Any] = {"attempted": False}
+    second_stage_trigger_note = None
+    second_stage_trigger_details: Optional[Dict[str, Any]] = None
     if auto_trigger:
         selected_backend = trigger_backend
         if selected_backend == "auto":
@@ -2795,6 +2797,13 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
 
         time.sleep(max(trigger_delay_sec, 0) if selected_backend != "qrenderdoc" else 0)
         ident = _extract_inject_ident(proc.returncode, stdout, stderr)
+        second_ident = None
+        if second_stage.get("enabled"):
+            second_ident = _extract_inject_ident(
+                second_stage.get("return_code"),
+                second_stage.get("stdout", ""),
+                second_stage.get("stderr", ""),
+            )
         use_target_control = selected_backend == "targetcontrol"
         if use_target_control and ident is not None:
             renderdoc_dll = renderdoccmd.parent / "renderdoc.dll"
@@ -2818,6 +2827,34 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
                     )
             else:
                 trigger_note = f"targetcontrol skipped: renderdoc.dll not found at {renderdoc_dll}"
+        if (
+            use_target_control
+            and second_ident is not None
+            and second_ident != ident
+        ):
+            renderdoc_dll = renderdoccmd.parent / "renderdoc.dll"
+            if renderdoc_dll.exists():
+                second_stage_trigger_details = _targetcontrol_trigger(
+                    renderdoc_dll=renderdoc_dll,
+                    ident=second_ident,
+                    trigger_frames=1,
+                    cycle_active_window_count=cycle_active_window_count,
+                    client_name="renderdoc-mcp",
+                )
+                if second_stage_trigger_details.get("triggered"):
+                    second_stage_trigger_note = (
+                        f"second-stage targetcontrol TriggerCapture(1) after {trigger_delay_sec}s; "
+                        f"ident={second_ident}; connected={second_stage_trigger_details.get('connected')}"
+                    )
+                else:
+                    second_stage_trigger_note = (
+                        f"second-stage targetcontrol failed after {trigger_delay_sec}s; "
+                        f"ident={second_ident}; error={second_stage_trigger_details.get('error')}"
+                    )
+            else:
+                second_stage_trigger_note = (
+                    f"second-stage targetcontrol skipped: renderdoc.dll not found at {renderdoc_dll}"
+                )
 
         if (
             not trigger_details.get("triggered")
@@ -2871,6 +2908,8 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
         "second_stage": second_stage,
         "trigger_note": trigger_note,
         "trigger_details": trigger_details,
+        "second_stage_trigger_note": second_stage_trigger_note,
+        "second_stage_trigger_details": second_stage_trigger_details,
         "capture_template": str(capture_output),
         "latest_capture": str(latest) if latest else None,
         "temp_collected_from": temp_collected_from,
@@ -3241,3 +3280,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
