@@ -124,7 +124,7 @@ class ExternalMCPProxy:
                     {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {},
-                        "clientInfo": {"name": "renderdoc-mcp-proxy", "version": "0.1.0"},
+                        "clientInfo": {"name": "renderdoc-workbench-proxy", "version": "0.1.0"},
                     },
                     timeout_sec=15.0,
                 )

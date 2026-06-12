@@ -74,7 +74,7 @@ except Exception:
         server_runtime = None
 
 
-SERVER_NAME = "renderdoc-mcp"
+SERVER_NAME = "renderdoc-workbench"
 SERVER_VERSION = "0.1.0"
 VK_F12 = 0x7B
 KEYEVENTF_KEYUP = 0x0002
@@ -635,7 +635,7 @@ def _qrenderdoc_python_trigger(
         details["error"] = f"qrenderdoc.exe not found: {qrenderdoc}"
         return details
 
-    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_qrd_"))
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_workbench_qrd_"))
     script_path = run_dir / "qrd_trigger.py"
     result_path = run_dir / "qrd_result.json"
     log_path = run_dir / "qrd_trigger.log"
@@ -696,7 +696,7 @@ try:
     target = None
     for ident in ids:
         try:
-            t = rd.CreateTargetControl("", ident, "renderdoc-mcp-qrd", True)
+            t = rd.CreateTargetControl("", ident, "renderdoc-workbench-qrd", True)
             if t is None:
                 continue
             tgt = str(t.GetTarget())
@@ -1030,7 +1030,7 @@ def _make_ui_script(target_rdc: str, target_event: int, result_path: str) -> str
 
 
 def _run_ui_jump(mode: str, pass_filename: bool):
-    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_jump_"))
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_workbench_jump_"))
     script_path = run_dir / "jump.py"
     result_path = run_dir / "jump_result.json"
     script_path.write_text(_make_ui_script(str(rdc_path), int(event_id), str(result_path)), encoding="utf-8")
@@ -1722,7 +1722,7 @@ def _analyze_rdc_with_qrenderdoc(
     if rdc_path.suffix.lower() != ".rdc":
         raise ValueError(f"rdc_path must be .rdc: {rdc_path}")
 
-    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_analyze_"))
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_workbench_analyze_"))
     script_path = run_dir / "analyze_rdc.py"
     result_path = run_dir / "analyze_result.json"
     log_path = run_dir / "analyze.log"
@@ -2113,7 +2113,7 @@ def _focus_rdc_event_with_qrenderdoc(
     if int(event_id) <= 0:
         raise ValueError("event_id must be > 0")
 
-    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_focus_"))
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_workbench_focus_"))
     script_path = run_dir / "focus_event.py"
     result_path = run_dir / "focus_event_result.json"
     log_path = run_dir / "focus_event.log"
@@ -2813,7 +2813,7 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
                     ident=ident,
                     trigger_frames=1,
                     cycle_active_window_count=cycle_active_window_count,
-                    client_name="renderdoc-mcp",
+                    client_name="renderdoc-workbench",
                 )
                 if trigger_details.get("triggered"):
                     trigger_note = (
@@ -2839,7 +2839,7 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
                     ident=second_ident,
                     trigger_frames=1,
                     cycle_active_window_count=cycle_active_window_count,
-                    client_name="renderdoc-mcp",
+                    client_name="renderdoc-workbench",
                 )
                 if second_stage_trigger_details.get("triggered"):
                     second_stage_trigger_note = (

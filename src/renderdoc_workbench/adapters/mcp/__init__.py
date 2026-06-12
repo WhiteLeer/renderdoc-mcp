@@ -1,0 +1,2 @@
+"""Optional MCP compatibility adapters."""
+

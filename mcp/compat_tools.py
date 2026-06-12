@@ -160,7 +160,7 @@ def _qrenderdoc_python_exec(
     payload: Dict[str, Any],
     timeout_sec: float = 75.0,
 ) -> Dict[str, Any]:
-    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_compat_"))
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_workbench_compat_"))
     script_path = run_dir / "exec.py"
     result_path = run_dir / "result.json"
     log_path = run_dir / "exec.log"
